@@ -1078,7 +1078,7 @@ static int fwu_read_flash_status(void)
 {
 	int retval;
 	unsigned char status;
-	struct f34_v7_data_1_5 data15;
+	unsigned char command;
 	struct synaptics_rmi4_data *rmi4_data = fwu->rmi4_data;
 
 	retval = synaptics_rmi4_reg_read(rmi4_data,
@@ -1088,17 +1088,6 @@ static int fwu_read_flash_status(void)
 	if (retval < 0) {
 		dev_err(LOGDEV,
 				"%s: Failed to read flash status\n",
-				__func__);
-		return retval;
-	}
-
-	retval = synaptics_rmi4_reg_read(rmi4_data,
-			fwu->f34_fd.data_base_addr + fwu->off.partition_id,
-			(unsigned char *)&data15,
-			sizeof(data15));
-	if (retval < 0) {
-		dev_err(LOGDEV,
-				"%s: Failed to read data15\n",
 				__func__);
 		return retval;
 	}
@@ -1114,8 +1103,8 @@ static int fwu_read_flash_status(void)
 
 	if (fwu->flash_status != 0x00) {
 		dev_err(LOGDEV,
-				"%s: Flash status = %d, part_id = %d, command = 0x%02x\n",
-				__func__, fwu->flash_status, data15.partition_id, data15.command);
+				"%s: Flash status = %d, command = 0x%02x\n",
+				__func__, fwu->flash_status, fwu->command);
 	}
 
 	if (fwu->bl_version >= BL_V7) {
@@ -1123,7 +1112,23 @@ static int fwu_read_flash_status(void)
 			fwu->flash_status = 0x00;
 	}
 
-	fwu->command = data15.command;
+	retval = synaptics_rmi4_reg_read(rmi4_data,
+			fwu->f34_fd.data_base_addr + fwu->off.flash_cmd,
+			&command,
+			sizeof(command));
+	if (retval < 0) {
+		dev_err(LOGDEV,
+				"%s: Failed to read flash command\n",
+				__func__);
+		return retval;
+	}
+
+	if (fwu->bl_version == BL_V5)
+		fwu->command = command & MASK_4BIT;
+	else if (fwu->bl_version == BL_V6)
+		fwu->command = command & MASK_6BIT;
+	else
+		fwu->command = command;
 
 	return 0;
 }
@@ -1209,17 +1214,7 @@ static void fwu_reset_device(void)
 
 static int fwu_wait_for_idle(int timeout_ms)
 {
-	int retval, counter = fwu->irq_sema.count;
-
-	/* handle missed irq */
-	if (counter > 0) {
-		int i;
-		for (i = 0; i < counter; i++)
-			down(&fwu->irq_sema);
-		dev_warn(LOGDEV,
-				"%s: invalid semaphore counter %d\n",
-				__func__, counter);
-	}
+	int retval;
 
 	retval = down_timeout(&fwu->irq_sema, msecs_to_jiffies(timeout_ms));
 	if (retval) {
@@ -1888,10 +1883,6 @@ static int fwu_read_f34_queries(void)
 	else
 		retval = fwu_read_f34_v5v6_queries();
 
-	dev_info(LOGDEV,
-			"%s: BL version = %d\n",
-			__func__, fwu->bl_version);
-
 	return retval;
 }
 
@@ -2433,6 +2424,8 @@ static int fwu_scan_pdt(void)
 							__func__);
 					return -EINVAL;
 				}
+				dev_info(LOGDEV, "%s: BL version = %d\n",
+					__func__, fwu->bl_version);
 
 				fwu->intr_mask = 0;
 				intr_src = rmi_fd.intr_src_count;
@@ -4392,37 +4385,12 @@ exit:
 	return;
 }
 
-static int synaptics_rmi4_fwu_flash_status(
-	struct synaptics_rmi4_data *rmi4_data)
-{
-	int istatus = 0, retval;
-	unsigned char status;
-
-	if (fwu == NULL)
-		return -EINVAL;
-
-	rmi4_data = fwu->rmi4_data;
-	retval = synaptics_rmi4_reg_read(rmi4_data,
-			fwu->f34_fd.data_base_addr + fwu->off.flash_status,
-			&status,
-			sizeof(status));
-	if (retval < 0) {
-		dev_err(LOGDEV,
-			"%s: Failed to read flash status\n", __func__);
-		return retval;
-	}
-	istatus = status >> 7;
-
-	return istatus;
-}
-
 static int __init rmi4_fw_update_module_init(void)
 {
 	synaptics_rmi4_new_function(RMI_FW_UPDATER, true,
 		synaptics_rmi4_fwu_init,
 		synaptics_rmi4_fwu_remove,
 		synaptics_rmi4_fwu_attn,
-		synaptics_rmi4_fwu_flash_status,
 		IC_MODE_ANY);
 
 	return 0;
@@ -4435,7 +4403,6 @@ static void __exit rmi4_fw_update_module_exit(void)
 		synaptics_rmi4_fwu_init,
 		synaptics_rmi4_fwu_remove,
 		synaptics_rmi4_fwu_attn,
-		synaptics_rmi4_fwu_flash_status,
 		IC_MODE_ANY);
 
 	wait_for_completion(&fwu_remove_complete);

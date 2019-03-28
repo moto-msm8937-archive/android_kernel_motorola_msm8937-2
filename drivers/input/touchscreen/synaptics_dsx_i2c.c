@@ -95,15 +95,6 @@
 
 #define tk_debug(fmt, args...)
 
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-#include <linux/screen_off_gestures.h>
-static bool suspended = false;
-bool scr_suspended(void)
-{
-	return suspended;
-}
-#endif
-
 #ifdef CONFIG_MMI_HALL_NOTIFICATIONS
 static int folio_notifier_callback(struct notifier_block *self,
 				 unsigned long event, void *data);
@@ -2273,7 +2264,6 @@ struct synaptics_rmi4_exp_fn {
 	void (*func_remove)(struct synaptics_rmi4_data *rmi4_data);
 	void (*func_attn)(struct synaptics_rmi4_data *rmi4_data,
 			unsigned char intr_mask);
-	int (*func_status)(struct synaptics_rmi4_data *rmi4_data);
 	struct list_head link;
 };
 
@@ -2716,11 +2706,6 @@ static void synaptics_dsx_apply_modifiers(
 				wakeup = true;
 			if (!sleep && (patch->flags & FLAG_POWER_SLEEP))
 				sleep = true;
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-			if (!wakeup && (gesture_swipe_right || gesture_swipe_left || gesture_swipe_down || gesture_swipe_up || dt2w_switch))
-				wakeup = true;
-#endif
-
 			/* finally apply patch */
 			synaptics_dsx_patch_function(rmi4_data,
 				synaptics_cfg_regs[i].f_number, patch);
@@ -2793,33 +2778,24 @@ static int synaptics_dsx_wait_for_idle(struct synaptics_rmi4_data *rmi4_data)
 	return 0;
 }
 
-static int synaptics_rmi4_f01_flashprog_status(
-		struct synaptics_rmi4_data *rmi4_data)
-{
-	int retval;
-	struct synaptics_rmi4_f01_device_status status;
-
-	retval = synaptics_rmi4_i2c_read(rmi4_data,
-					rmi4_data->f01_data_base_addr,
-					status.data,
-					sizeof(status.data));
-	return retval < 0 ? retval : status.flash_prog;
-}
-
 static int synaptics_dsx_sensor_ready_state(
 		struct synaptics_rmi4_data *rmi4_data, bool standby)
 {
 	bool ui_mode;
 	int retval, state, i;
+	struct synaptics_rmi4_f01_device_status status;
 
 	for (i = 0; i < 10; ++i) {
-		retval = rmi4_data->get_status(rmi4_data);
+		retval = synaptics_rmi4_i2c_read(rmi4_data,
+					rmi4_data->f01_data_base_addr,
+					status.data,
+					sizeof(status.data));
 		if (retval < 0) {
 			pr_err("(%d) Failed to query touch ic status\n", i);
 			return retval;
 		}
 
-		ui_mode = retval == 0;
+		ui_mode = status.flash_prog == 0;
 		pr_debug("(%d) UI mode: %s\n", i, ui_mode ? "true" : "false");
 
 		if (ui_mode)
@@ -2878,7 +2854,6 @@ static void synaptics_dsx_sensor_state(struct synaptics_rmi4_data *rmi4_data,
 
 	switch (state) {
 	case STATE_UNKNOWN:
-		rmi4_data->in_bootloader = false;
 	case STATE_FLASH:
 		/* no special handling for these states */
 			break;
@@ -4411,10 +4386,7 @@ static int synaptics_rmi4_f12_abs_report(struct synaptics_rmi4_data *rmi4_data,
 
 	if (atomic_read(&rmi4_data->panel_off_flag)) {
 		synaptics_dsx_resumeinfo_ignore(rmi4_data);
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-		if (!gesture_swipe_right && !gesture_swipe_left && !gesture_swipe_down && !gesture_swipe_up && !dt2w_switch)
-#endif
-			return 0;
+		return 0;
 	} else
 		synaptics_dsx_resumeinfo_purgeoff(rmi4_data);
 
@@ -4729,11 +4701,6 @@ static int synaptics_rmi4_f11_abs_report(struct synaptics_rmi4_data *rmi4_data,
 					"z = %d\n",
 					__func__, finger,
 					x, y, wx, wy, z);
-
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-			if (suspended)
-				x += 5000;
-#endif
 
 			input_report_abs(rmi4_data->input_dev,
 					ABS_MT_POSITION_X, x);
@@ -5072,14 +5039,8 @@ static void synaptics_rmi4_report_touch(struct synaptics_rmi4_data *rmi4_data,
 
 	case SYNAPTICS_RMI4_F12:
 		if (rmi4_data->suspend_is_wakeable) {
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-			if (!gesture_swipe_right && !gesture_swipe_left && !gesture_swipe_down && !gesture_swipe_up && !dt2w_switch) {
-#endif
-				synaptics_rmi4_f12_wakeup_gesture(rmi4_data, fhandler);
-				break;
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-			}
-#endif
+			synaptics_rmi4_f12_wakeup_gesture(rmi4_data, fhandler);
+			break;
 		}
 
 		synaptics_dsx_resumeinfo_isr(rmi4_data);
@@ -5341,6 +5302,12 @@ static int synaptics_rmi4_f11_init(struct synaptics_rmi4_data *rmi4_data,
 	}
 
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
+	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
+		fhandler->intr_reg_num = 0;
+		fhandler->num_of_data_sources = 0;
+		fhandler->intr_mask = 0;
+		return -EINVAL;
+	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 
@@ -5485,6 +5452,12 @@ static int synaptics_rmi4_f51_init(struct synaptics_rmi4_data *rmi4_data,
 	fhandler->fn_number = fd->fn_number;
 	fhandler->num_of_data_sources = (fd->intr_src_count  & MASK_3BIT);
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
+	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
+		fhandler->intr_reg_num = 0;
+		fhandler->num_of_data_sources = 0;
+		fhandler->intr_mask = 0;
+		return -EINVAL;
+	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 	/* Set an enable bit for each data source */
@@ -5618,6 +5591,12 @@ static int synaptics_rmi4_f12_init(struct synaptics_rmi4_data *rmi4_data,
 		return -ENOENT;
 
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
+	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
+		fhandler->intr_reg_num = 0;
+		fhandler->num_of_data_sources = 0;
+		fhandler->intr_mask = 0;
+		return -EINVAL;
+	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 
@@ -5739,6 +5718,13 @@ static int synaptics_rmi4_f1a_init(struct synaptics_rmi4_data *rmi4_data,
 	fhandler->num_of_data_sources = (fd->intr_src_count  & MASK_3BIT);
 
 	fhandler->intr_reg_num = (intr_count + 7) / 8;
+	if (fhandler->intr_reg_num >= MAX_INTR_REGISTERS) {
+		fhandler->intr_reg_num = 0;
+		fhandler->num_of_data_sources = 0;
+		fhandler->intr_mask = 0;
+		retval = -EINVAL;
+		goto error_exit;
+	}
 	if (fhandler->intr_reg_num != 0)
 		fhandler->intr_reg_num -= 1;
 
@@ -6186,11 +6172,8 @@ static int synaptics_rmi4_query_device(struct synaptics_rmi4_data *rmi4_data)
 				if (retval < 0)
 					return retval;
 
-				/* FlashProg bit might be inaccurate, so */
-				/* do not change the flag if it is set */
-				if (!rmi4_data->in_bootloader)
-					rmi4_data->in_bootloader =
-							status.flash_prog == 1;
+				rmi4_data->in_bootloader =
+						status.flash_prog == 1;
 				break;
 
 			case SYNAPTICS_RMI4_F11:
@@ -6284,6 +6267,8 @@ static int synaptics_rmi4_query_device(struct synaptics_rmi4_data *rmi4_data)
 	dev_dbg(&rmi4_data->i2c_client->dev,
 			"%s: Number of interrupt registers = %d\n",
 			__func__, rmi4_data->num_of_intr_regs);
+	if (rmi4_data->num_of_intr_regs >= MAX_INTR_REGISTERS)
+		return -EINVAL;
 
 	f12_handler = get_fhandler(rmi4_data, SYNAPTICS_RMI4_F12);
 	if (!f12_handler) {
@@ -6769,29 +6754,6 @@ static void synaptics_rmi4_detection_work(struct work_struct *work)
 			} else
 				control_access_block_update_dynamic(rmi4_data);
 		}
-
-
-		if (exp_fhandler->fn_type == RMI_FW_UPDATER) {
-			int status;
-
-			if (!exp_fhandler->func_status)
-				continue;
-			status = exp_fhandler->func_status(rmi4_data);
-			/* consider changing to */
-			/* if (status == 1) */
-			/* if Synaptics confirm only 1 is valid */
-			if (status) {
-				struct synaptics_rmi4_device_info *rmi;
-
-				rmi = &(rmi4_data->rmi4_mod_info);
-				rmi4_data->in_bootloader = true;
-				pr_info("Product: %s is in bootloader mode\n",
-					rmi->product_id_string);
-			}
-			/* replace default status retrieval function */
-			rmi4_data->get_status = exp_fhandler->func_status;
-			pr_info("using F34 status retrieval function\n");
-		}
 	}
 
 release_mutex:
@@ -6816,9 +6778,7 @@ void synaptics_rmi4_new_function(enum exp_fn fn_type, bool insert,
 		int (*func_init)(struct synaptics_rmi4_data *rmi4_data),
 		void (*func_remove)(struct synaptics_rmi4_data *rmi4_data),
 		void (*func_attn)(struct synaptics_rmi4_data *rmi4_data,
-		unsigned char intr_mask),
-		int (*func_status)(struct synaptics_rmi4_data *rmi4_data),
-		enum ic_modes mode)
+		unsigned char intr_mask), enum ic_modes mode)
 {
 	struct synaptics_rmi4_exp_fn *exp_fhandler;
 
@@ -6846,7 +6806,6 @@ void synaptics_rmi4_new_function(enum exp_fn fn_type, bool insert,
 		exp_fhandler->fn_type = fn_type;
 		exp_fhandler->func_init = func_init;
 		exp_fhandler->func_attn = func_attn;
-		exp_fhandler->func_status = func_status;
 		exp_fhandler->func_remove = func_remove;
 		exp_fhandler->inserted = false;
 		exp_fhandler->mode = mode;
@@ -6857,7 +6816,6 @@ void synaptics_rmi4_new_function(enum exp_fn fn_type, bool insert,
 				exp_fhandler->inserted = false;
 				exp_fhandler->func_init = NULL;
 				exp_fhandler->func_attn = NULL;
-				exp_fhandler->func_status = NULL;
 				goto exit;
 			}
 		}
@@ -7173,7 +7131,7 @@ device_destroy:
 static int synaptics_rmi4_probe(struct i2c_client *client,
 		const struct i2c_device_id *dev_id)
 {
-	int retval = 0;
+	int retval;
 	struct pinctrl *pinctrl;
 	unsigned char attr_count;
 	struct synaptics_rmi4_data *rmi4_data;
@@ -7237,7 +7195,6 @@ static int synaptics_rmi4_probe(struct i2c_client *client,
 	rmi4_data->ready_state = synaptics_dsx_sensor_ready_state;
 	rmi4_data->irq_enable = synaptics_rmi4_irq_enable;
 	rmi4_data->reset_device = synaptics_rmi4_reset_device;
-	rmi4_data->get_status = synaptics_rmi4_f01_flashprog_status;
 
 	/* Initialize some resume debug information */
 	rmi4_data->resume_info = kzalloc(
@@ -7809,10 +7766,6 @@ static int synaptics_rmi4_suspend(struct device *dev)
 			rmi4_data->board;
 	static char ud_stats[PAGE_SIZE];
 
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-	suspended = true;
-#endif
-
 	if (atomic_cmpxchg(&rmi4_data->touch_stopped, 0, 1) == 1)
 		return 0;
 
@@ -7877,10 +7830,6 @@ static int synaptics_rmi4_resume(struct device *dev)
 					i2c_get_clientdata(to_i2c_client(dev));
 	const struct synaptics_dsx_platform_data *platform_data =
 					rmi4_data->board;
-
-#ifdef CONFIG_SCREEN_OFF_GESTURES
-	suspended = false;
-#endif
 
 	if (atomic_cmpxchg(&rmi4_data->touch_stopped, 1, 0) == 0)
 		return 0;
