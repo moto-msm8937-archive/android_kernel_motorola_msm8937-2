@@ -50,6 +50,15 @@
 		mmi,ospl-left-feedback;
 	};
 
+	android_usb: android_usb@86000c8 {
+		compatible = "qcom,android-usb";
+		reg = <0x086000c8 0xc8>;
+		qcom,pm-qos-latency = <2 1001 12701>;
+		qcom,supported-func = "ffs","audio","diag","serial",
+			"mass_storage","rndis_gsi","ecm_gsi","rmnet_gsi",
+			"mbim_gsi","dpl_gsi","gps","qdss","rndis","ipc";
+	};
+
 	sound {
 		qcom,msm-mbhc-hphl-swh = <1>;
 		qcom,msm-mbhc-gnd-swh = <0>;
