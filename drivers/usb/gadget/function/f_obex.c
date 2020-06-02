@@ -20,7 +20,7 @@
 #include <linux/module.h>
 
 #include "u_serial.h"
-#include "gadget_chips.h"
+#include "../udc/gadget_chips.h"
 
 
 /*
